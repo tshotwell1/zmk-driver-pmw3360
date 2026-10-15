@@ -318,8 +318,10 @@ static void pmw3360_async_init(struct k_work *work) {
 
     // Configure the CPI, this may be been overriden by a call to set_attr
     uint16_t cpi = data->cpi ? data->cpi : config->cpi;
-    pmw3360_spi_write_reg(dev, PMW3360_REG_CONFIG_1, (cpi / 100) - 1);
-
+    uint16_t res = (cpi / 50) - 1;                     // PMW3389: 50 CPI steps, 16-bit
+    pmw3360_spi_write_reg(dev, 0x0E, res & 0xFF);      // Resolution_L
+    pmw3360_spi_write_reg(dev, 0x0F, res >> 8);        // Resolution_H
+   
     // We always enable rest mode to save a bit of power, but probably this is a
     // wired device so it could be turned off.
     pmw3360_spi_write_reg(dev, PMW3360_REG_CONFIG_2, PWM3360_CONFIG_2_REST_EN);
@@ -378,7 +380,9 @@ static int pmw3360_attr_set(const struct device *dev, enum sensor_channel chan, 
                 data->cpi = val->val1;
             }
             else {
-                pmw3360_spi_write_reg(dev, PMW3360_REG_CONFIG_1, ((uint32_t) (val->val1) / 100) - 1);
+                uint16_t res = ((uint32_t) val->val1 / 50) - 1;
+                pmw3360_spi_write_reg(dev, 0x0E, res & 0xFF);
+                pmw3360_spi_write_reg(dev, 0x0F, res >> 8);
             }
             break;
         default:
