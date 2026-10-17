@@ -19,6 +19,43 @@ LOG_MODULE_REGISTER(pmw3360, CONFIG_INPUT_LOG_LEVEL);
     K_THREAD_STACK_DEFINE(pmw3360_stack, CONFIG_INPUT_PIXART_PMW3360_THREAD_STACK_SIZE);
 #endif
 
+// sin(0) through sin(90) degrees, scaled by PMW3360_TRIG_SCALE. Used to rotate
+// the reported deltas in software. The PMW3389 has no orientation register, and
+// its Angle_Tune register only covers +/-30 degrees, so this is the only way to
+// support an arbitrary mounting angle.
+static const int16_t pmw3360_sin_table[91] = {
+       0,   71,  143,  214,  286,  357,  428,  499,  570,  641,
+     711,  782,  852,  921,  991, 1060, 1129, 1198, 1266, 1334,
+    1401, 1468, 1534, 1600, 1666, 1731, 1796, 1860, 1923, 1986,
+    2048, 2110, 2171, 2231, 2290, 2349, 2408, 2465, 2522, 2578,
+    2633, 2687, 2741, 2793, 2845, 2896, 2946, 2996, 3044, 3091,
+    3138, 3183, 3228, 3271, 3314, 3355, 3396, 3435, 3474, 3511,
+    3547, 3582, 3617, 3650, 3681, 3712, 3742, 3770, 3798, 3824,
+    3849, 3873, 3896, 3917, 3937, 3956, 3974, 3991, 4006, 4021,
+    4034, 4046, 4056, 4065, 4074, 4080, 4086, 4090, 4094, 4095,
+    4096
+};
+
+// sin of an angle in whole degrees, scaled by PMW3360_TRIG_SCALE.
+static int16_t pmw3360_sin(const uint16_t degrees) {
+    const uint16_t d = degrees % 360;
+    if (d <= 90) {
+        return pmw3360_sin_table[d];
+    }
+    if (d <= 180) {
+        return pmw3360_sin_table[180 - d];
+    }
+    if (d <= 270) {
+        return -pmw3360_sin_table[d - 180];
+    }
+    return -pmw3360_sin_table[360 - d];
+}
+
+// cos of an angle in whole degrees, scaled by PMW3360_TRIG_SCALE.
+static int16_t pmw3360_cos(const uint16_t degrees) {
+    return pmw3360_sin(degrees + 90);
+}
+
 static int pmw3360_set_interrupt(const struct device *dev, const bool en) {
     const struct pmw3360_config *config = dev->config;
     int err = gpio_pin_interrupt_configure_dt(&config->irq_gpio,
@@ -197,26 +234,54 @@ static int pmw3360_init_irq(const struct device *dev) {
 
 static void pmw3360_read_motion_report(const struct device *dev) {
     const struct pmw3360_config *config = dev->config;
+    struct pmw3360_data *data = dev->data;
     struct motion_burst motion_report = {};
     int err = pmw3360_spi_read_motion_burst(dev, (uint8_t *) &motion_report, sizeof(motion_report));
     if ((err != 0) || (motion_report.motion == 0xff)) {
         // If burst most became deactivated for some reason, reactivate it.
         // We see this sometimes if there is a second device on the SPI bus.
-        struct pmw3360_data *data = dev->data;
         data->motion_burst_active = false;
         pmw3360_spi_read_motion_burst(dev, (uint8_t *) &motion_report, sizeof(motion_report));
     }
 
     if (motion_report.motion & PMW3360_MOTION_MOT) {
         int16_t dx = (motion_report.delta_x_h << 8) | motion_report.delta_x_l;
+        int16_t dy = (motion_report.delta_y_h << 8) | motion_report.delta_y_l;
+
+        // Rotate the deltas to compensate for how the sensor is mounted in the
+        // socket. The residuals carry the remainder of each division over to
+        // the next report, so slow movement is not lost to rounding.
+        if (config->rotation != 0) {
+            const int32_t rx = ((int32_t) dx * data->cos_rotation)
+                             - ((int32_t) dy * data->sin_rotation) + data->residual_x;
+            const int32_t ry = ((int32_t) dx * data->sin_rotation)
+                             + ((int32_t) dy * data->cos_rotation) + data->residual_y;
+
+            const int32_t ox = rx / PMW3360_TRIG_SCALE;
+            const int32_t oy = ry / PMW3360_TRIG_SCALE;
+
+            data->residual_x = rx - (ox * PMW3360_TRIG_SCALE);
+            data->residual_y = ry - (oy * PMW3360_TRIG_SCALE);
+
+            // A rotated vector can be up to sqrt(2) times longer than its
+            // components, so it can outgrow an int16_t where the raw delta did not.
+            dx = CLAMP(ox, INT16_MIN, INT16_MAX);
+            dy = CLAMP(oy, INT16_MIN, INT16_MAX);
+
+            if ((dx == 0) && (dy == 0)) {
+                // Nothing survived the rounding, don't send an empty report.
+                return;
+            }
+        }
+
         if (config->invert_x) {
             dx = -dx;
         }
-        input_report_rel(dev, INPUT_REL_X, dx, false, K_FOREVER);
-        int16_t dy = (motion_report.delta_y_h << 8) | motion_report.delta_y_l;
         if (config->invert_y) {
             dy = -dy;
         }
+
+        input_report_rel(dev, INPUT_REL_X, dx, false, K_FOREVER);
         input_report_rel(dev, INPUT_REL_Y, dy, true, K_FOREVER);
     }
 }
@@ -287,47 +352,50 @@ static void pmw3360_async_init(struct k_work *work) {
     // Step 6: download the SROM. We will skip this.
     // Step 7: configure the sensor.
 
-    // Log the sensor product and revision ID. We expect 0x66, 0x01
+    // Check that we are really talking to the sensor. The PMW3389 reports
+    // product ID 0x47, and Inverse_Product_ID holds its bitwise complement.
     uint8_t product_id = 0;
     int r1 = pmw3360_spi_read_reg(dev, PMW3360_REG_PRODUCT_ID, &product_id);
+
+    uint8_t inverse_product_id = 0;
+    pmw3360_spi_read_reg(dev, PMW3360_REG_INVERSE_PRODUCT_ID, &inverse_product_id);
 
     uint8_t revision_id = 0;
     int r2 = pmw3360_spi_read_reg(dev, PMW3360_REG_REVISION_ID, &revision_id);
 
-    LOG_DBG("pmw3360 product %d (%d), resivion %d (%d)", product_id, r1, revision_id, r2);
+    LOG_DBG("pmw3389 product 0x%02x (%d), revision 0x%02x (%d)", product_id, r1, revision_id, r2);
+
+    if ((r1 < 0) || (product_id != PMW3389_PRODUCT_ID) ||
+        (inverse_product_id != (uint8_t) ~PMW3389_PRODUCT_ID)) {
+        LOG_WRN("Unexpected product ID 0x%02x (inverse 0x%02x), expected 0x%02x. Check the SPI wiring.",
+                product_id, inverse_product_id, PMW3389_PRODUCT_ID);
+    }
 
     k_mutex_lock(&data->mutex, K_FOREVER);
 
-    // Configure the sensor orientation
-    if (config->rotate_90) {
-        if (config->rotate_180 || config->rotate_270) {
-            LOG_ERR("Multiple rotations specified, configuring 90 degrees.");
-        }
-        pmw3360_spi_write_reg(dev, PMW3360_REG_CONTROL, PMW3360_CONTROL_ROTATE_90);
-    }
-    else if (config->rotate_180) {
-        if (config->rotate_270) {
-            LOG_ERR("Multiple rotations specified, configuring 180 degrees.");
-
-        }
-        pmw3360_spi_write_reg(dev, PMW3360_REG_CONTROL, PMW3360_CONTROL_ROTATE_180);
-    }
-    else if (config->rotate_270) {
-        pmw3360_spi_write_reg(dev, PMW3360_REG_CONTROL, PMW3360_CONTROL_ROTATE_270);
-    }
+    // Configure the sensor orientation. Unlike the PMW3360, the PMW3389 has no
+    // Control register, so the rotation is applied to the deltas in software.
+    data->sin_rotation = pmw3360_sin(config->rotation);
+    data->cos_rotation = pmw3360_cos(config->rotation);
+    data->residual_x = 0;
+    data->residual_y = 0;
+    LOG_DBG("Rotating reports by %d degrees", config->rotation);
 
     // Configure the CPI, this may be been overriden by a call to set_attr
     uint16_t cpi = data->cpi ? data->cpi : config->cpi;
-    uint16_t res = (cpi / 50) - 1;                     // PMW3389: 50 CPI steps, 16-bit
-    pmw3360_spi_write_reg(dev, 0x0E, res & 0xFF);      // Resolution_L
-    pmw3360_spi_write_reg(dev, 0x0F, res >> 8);        // Resolution_H
+    uint16_t res = (CLAMP(cpi, PMW3389_CPI_MIN, PMW3389_CPI_MAX) / PMW3389_CPI_STEP) - 1;
+    pmw3360_spi_write_reg(dev, PMW3389_REG_RESOLUTION_L, res & 0xFF);
+    pmw3360_spi_write_reg(dev, PMW3389_REG_RESOLUTION_H, res >> 8);
    
     // We always enable rest mode to save a bit of power, but probably this is a
     // wired device so it could be turned off.
     pmw3360_spi_write_reg(dev, PMW3360_REG_CONFIG_2, PWM3360_CONFIG_2_REST_EN);
 
-    // Allow extra control over the sensor orientation
-    pmw3360_spi_write_reg(dev, PMW3360_REG_ANGLE_TUNE, config->angle_tune);
+    // Allow extra control over the sensor orientation. A register value of 0 is
+    // clipped to 1 by the sensor, so leave it alone unless it was asked for.
+    if (config->angle_tune != 0) {
+        pmw3360_spi_write_reg(dev, PMW3360_REG_ANGLE_TUNE, config->angle_tune);
+    }
 
     // There are only 2 allowed lift off values, 2mm and 3mm.
     if (config->lift_height_3mm) {
@@ -392,9 +460,10 @@ static int pmw3360_attr_set(const struct device *dev, enum sensor_channel chan, 
                 data->cpi = val->val1;
             }
             else {
-                uint16_t res = ((uint32_t) val->val1 / 50) - 1;
-                pmw3360_spi_write_reg(dev, 0x0E, res & 0xFF);
-                pmw3360_spi_write_reg(dev, 0x0F, res >> 8);
+                uint16_t res = (CLAMP(val->val1, PMW3389_CPI_MIN, PMW3389_CPI_MAX)
+                                / PMW3389_CPI_STEP) - 1;
+                pmw3360_spi_write_reg(dev, PMW3389_REG_RESOLUTION_L, res & 0xFF);
+                pmw3360_spi_write_reg(dev, PMW3389_REG_RESOLUTION_H, res >> 8);
             }
             break;
         default:
@@ -412,6 +481,13 @@ static const struct sensor_driver_api pmw3360_driver_api = {
 
 #define PMW3360_SPI_MODE (SPI_OP_MODE_MASTER | SPI_WORD_SET(8) | SPI_MODE_CPOL | SPI_MODE_CPHA | SPI_TRANSFER_MSB | SPI_HOLD_ON_CS | SPI_LOCK_ON)
 
+// The effective rotation in degrees. rotate-90/180/270 are kept as aliases for
+// the equivalent rotation values so that existing configurations keep working.
+#define PMW3360_ROTATION(n) ((DT_PROP(DT_DRV_INST(n), rotation)                                    \
+                            + (DT_PROP(DT_DRV_INST(n), rotate_90) ? 90 : 0)                        \
+                            + (DT_PROP(DT_DRV_INST(n), rotate_180) ? 180 : 0)                      \
+                            + (DT_PROP(DT_DRV_INST(n), rotate_270) ? 270 : 0)) % 360)
+
 #define PMW3360_DEFINE(n)                                                                          \
     static struct pmw3360_data data##n = {};                                                       \
     static const struct pmw3360_config config##n = {                                               \
@@ -420,9 +496,7 @@ static const struct sensor_driver_api pmw3360_driver_api = {
         .irq_gpio = GPIO_DT_SPEC_GET_OR(DT_DRV_INST(n), irq_gpios, {}),                            \
         .reset_gpio = GPIO_DT_SPEC_GET_OR(DT_DRV_INST(n), reset_gpios, {}),                        \
         .cpi = DT_PROP(DT_DRV_INST(n), cpi),                                                       \
-        .rotate_90 = DT_PROP(DT_DRV_INST(n), rotate_90),                                           \
-        .rotate_180 = DT_PROP(DT_DRV_INST(n), rotate_180),                                         \
-        .rotate_270 = DT_PROP(DT_DRV_INST(n), rotate_270),                                         \
+        .rotation = PMW3360_ROTATION(n),                                                           \
         .angle_tune = DT_PROP(DT_DRV_INST(n), angle_tune),                                         \
         .lift_height_3mm = DT_PROP(DT_DRV_INST(n), lift_height_3mm),                               \
         .polling_interval = DT_PROP(DT_DRV_INST(n), polling_interval),                             \

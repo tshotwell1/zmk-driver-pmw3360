@@ -27,8 +27,17 @@ extern "C" {
 #define PMW3360_T_SWR 180 // Same as T_SWW
 #define PMW3360_T_SRAD_MOTBR 35
 
-// Select register addresses and values
+// Select register addresses and values.
+//
+// NOTE: this is the PMW3389 register map. It is almost identical to the
+// PMW3360, but there are two differences which matter here:
+//  - 0x0D is Ripple_Control on the PMW3389. On the PMW3360 it is Control,
+//    which carries the invert-X/invert-Y/swap-XY bits. The PMW3389 has no
+//    equivalent register, so orientation is handled in software instead.
+//  - CPI is set through the 16-bit Resolution_L/Resolution_H pair in 50 CPI
+//    steps. On the PMW3360 it is a single Config1 register in 100 CPI steps.
 #define PMW3360_REG_PRODUCT_ID          0x00
+#   define PMW3389_PRODUCT_ID           0x47
 #define PMW3360_REG_REVISION_ID         0x01
 #define PMW3360_REG_MOTION              0x02
 #   define PMW3360_MOTION_MOT           0x80
@@ -36,21 +45,26 @@ extern "C" {
 #define PMW3360_REG_DELTA_X_H           0x04
 #define PMW3360_REG_DELTA_Y_L           0x05
 #define PMW3360_REG_DELTA_Y_H           0x06
-#define PMW3360_REG_CONTROL             0x0D
-#   define PMW3360_CONTROL_ROTATE_90    0xC0
-#   define PMW3360_CONTROL_ROTATE_180   0x60
-#   define PMW3360_CONTROL_ROTATE_270   0xA0
-#define PMW3360_REG_CONFIG_1            0x0F
+#define PMW3360_REG_RIPPLE_CONTROL      0x0D
+#define PMW3389_REG_RESOLUTION_L        0x0E
+#define PMW3389_REG_RESOLUTION_H        0x0F
+#   define PMW3389_CPI_STEP             50
+#   define PMW3389_CPI_MIN              50
+#   define PMW3389_CPI_MAX              16000
 #define PMW3360_REG_CONFIG_2            0x10
 #   define PMW3360_CONFIG_2_RTP_MOD     0x04
 #   define PWM3360_CONFIG_2_REST_EN     0x20
-
 #define PMW3360_REG_ANGLE_TUNE          0x11
 #define PMW3360_REG_POWER_UP            0x3A
+#define PMW3360_REG_INVERSE_PRODUCT_ID  0x3F
 #define PMW3360_REG_MOTION_BURST        0x50
 #define PMW3360_REG_LIFT_CONFIG         0x63
 #   define PMW3360_LIFT_CONFIG_2MM      0x02
 #   define PMW3360_LIFT_CONFIG_3MM      0x03
+
+// Fixed point scale used by the software rotation. Deltas are multiplied by
+// sin/cos values scaled by this factor, then divided back down.
+#define PMW3360_TRIG_SCALE 4096
 
 // Runtime configurable attributes
 enum pmw3360_attributes {
@@ -83,6 +97,14 @@ struct pmw3360_data {
     bool motion_burst_active;
     bool polling_mode;
     uint32_t last_poll_cycles;
+    // Software rotation state. sin/cos are scaled by PMW3360_TRIG_SCALE and
+    // computed once during initialization. The residuals carry the fractional
+    // part of a count over to the next report so that slow movement across a
+    // rotated axis is not lost to rounding.
+    int16_t sin_rotation;
+    int16_t cos_rotation;
+    int32_t residual_x;
+    int32_t residual_y;
 #if defined(CONFIG_INPUT_PIXART_PMW3360_USE_OWN_THREAD)
     struct k_work_q driver_work_queue;
 #endif
@@ -98,9 +120,7 @@ struct pmw3360_config {
     struct gpio_dt_spec irq_gpio;
     struct gpio_dt_spec reset_gpio;
     uint16_t cpi;
-    bool rotate_90;
-    bool rotate_180;
-    bool rotate_270;
+    uint16_t rotation; // Degrees, 0 - 359
     int8_t angle_tune;
     bool lift_height_3mm;
     uint32_t polling_interval;
